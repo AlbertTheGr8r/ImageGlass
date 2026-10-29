@@ -165,7 +165,7 @@ public sealed class MagickCodecAdapter : PhDisposable, ICodec
             options with { FrameIndex = -1 }, null, null, token).ConfigureAwait(false);
 
         var imgColl = output.MultiFrames;
-        if (imgColl?.Count < 2)
+        if (imgColl is null || imgColl.Count < 2)
         {
             // the metadata promised an animation but the decode disagrees; one frame still shows
             SKImage? onlyFrame = null;
@@ -196,42 +196,56 @@ public sealed class MagickCodecAdapter : PhDisposable, ICodec
         var minDecodeScale = double.PositiveInfinity;
         var totalBytes = 0L;
 
-        for (var i = 0; i < frameCount; i++)
+        try
         {
-            token.ThrowIfCancellationRequested();
-
-            using var imgFrame = SkiaCodec.FromMagick((MagickImage)imgColl[i],
-                MagickCodec.GetDecodedColorSpace(output, metadata), metadata.IsHdr, out var frameScale);
-            if (frameScale < minDecodeScale) minDecodeScale = frameScale;
-
-            // frame N owns its own delay; a reader without ticks falls back to the GIF 1/100 s
-            var imgFrameM = (MagickImage)imgColl[i];
-            var ticksPerSecond = imgFrameM.AnimationTicksPerSecond;
-            frameInfos[i] = new SKCodecFrameInfo
+            for (var i = 0; i < frameCount; i++)
             {
-                Duration = ticksPerSecond > 0
-                    ? (int)Math.Clamp(Math.Round(imgFrameM.AnimationDelay * 1000d / ticksPerSecond), 0, int.MaxValue)
-                    : 0,
-                AlphaType = imgFrame.IsDisposed() ? SKAlphaType.Opaque : imgFrame.AlphaType,
+                token.ThrowIfCancellationRequested();
 
-                // Magick delivers fully composed frames, so no frame ever builds on another
-                RequiredFrame = -1,
-                DisposalMethod = SKCodecAnimationDisposalMethod.Keep,
-            };
+                var imgFrameM = (MagickImage)imgColl[i];
+                using var imgFrame = SkiaCodec.FromMagick(imgFrameM,
+                    MagickCodec.GetDecodedColorSpace(output, metadata), metadata.IsHdr, out var frameScale);
+                if (frameScale < minDecodeScale) minDecodeScale = frameScale;
 
-            if (i == 0 && imgFrame is { } firstFrame)
-            {
-                frameSize = new Size(firstFrame.Width, firstFrame.Height);
-                totalBytes = (long)firstFrame.Info.BytesPerPixel * firstFrame.Width * firstFrame.Height * frameCount;
+                // frame N owns its own delay; a reader without ticks falls back to the GIF 1/100 s
+                var ticksPerSecond = imgFrameM.AnimationTicksPerSecond;
+                frameInfos[i] = new SKCodecFrameInfo
+                {
+                    Duration = ticksPerSecond > 0
+                        ? (int)Math.Clamp(Math.Round(imgFrameM.AnimationDelay * 1000d / ticksPerSecond), 0, int.MaxValue)
+                        : 0,
+                    AlphaType = imgFrame.IsDisposed() ? SKAlphaType.Opaque : imgFrame.AlphaType,
+
+                    // Magick delivers fully composed frames, so no frame ever builds on another
+                    RequiredFrame = -1,
+                    DisposalMethod = SKCodecAnimationDisposalMethod.Keep,
+                };
+
+                if (i == 0 && imgFrame is { } firstFrame)
+                {
+                    frameSize = new Size(firstFrame.Width, firstFrame.Height);
+                    totalBytes = (long)firstFrame.Info.BytesPerPixel * firstFrame.Width * firstFrame.Height * frameCount;
+                }
+
+                // FromMagick copies the pixels into its own buffer and the animator keeps only the
+                // immutable SKBitmap, so free this decoded Magick frame now instead of at the end of
+                // the loop. Otherwise a long sequence holds every frame twice and peak memory doubles.
+                imgFrameM.Dispose();
+
+                if (imgFrame.IsDisposed()) continue;
+
+                // the animator surfaces each pre-decoded frame per request; the immutable copy
+                // below is its only copy: SKImage.FromBitmap shares the pixels, never re-copies
+                var frameBitmap = SKBitmap.FromImage(imgFrame);
+                frameBitmap.SetImmutable();
+                frameBitmaps[i] = frameBitmap;
             }
-
-            if (imgFrame.IsDisposed()) continue;
-
-            // the animator surfaces each pre-decoded frame per request; the immutable copy
-            // below is its only copy: SKImage.FromBitmap shares the pixels, never re-copies
-            var frameBitmap = SKBitmap.FromImage(imgFrame);
-            frameBitmap.SetImmutable();
-            frameBitmaps[i] = frameBitmap;
+        }
+        catch
+        {
+            // a cancelled or failed decode owns the frames copied so far and nothing else will
+            foreach (var frameBitmap in frameBitmaps) frameBitmap?.Dispose();
+            throw;
         }
 
         var animator = new MagickAnimator(frameInfos, frameBitmaps,

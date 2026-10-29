@@ -478,7 +478,10 @@ public partial class PhotoManager
         // Skia pipeline keeps alive; size it by its own frame count, within its decode budget
         if (photo.Bitmap is MagickAnimator && photo.Metadata.FrameCount > 1)
         {
-            var frameBytes = (long)photo.Width * photo.Height * photo.BytesPerPixel;
+            // an animator holds no SKImage, so Photo.BytesPerPixel cannot report the depth;
+            // mirror the decode gate: HDR frames land at RgbaF32 (16 bytes/px), SDR at 4
+            var bytesPerPixel = photo.Metadata.IsHdr ? 16 : 4;
+            var frameBytes = (long)photo.Width * photo.Height * bytesPerPixel;
             var totalBytes = frameBytes * Math.Max(1, (int)photo.Metadata.FrameCount);
             return Math.Min(totalBytes, MagickCodecAdapter.MaxAnimationBufferBytes);
         }

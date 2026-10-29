@@ -474,6 +474,15 @@ public partial class PhotoManager
     {
         if (photo.State != PhotoState.Loaded) return 0;
 
+        // a Magick sequence animator pre-decodes every frame, not just the composite the
+        // Skia pipeline keeps alive; size it by its own frame count, within its decode budget
+        if (photo.Bitmap is MagickAnimator && photo.Metadata.FrameCount > 1)
+        {
+            var frameBytes = (long)photo.Width * photo.Height * photo.BytesPerPixel;
+            var totalBytes = frameBytes * Math.Max(1, (int)photo.Metadata.FrameCount);
+            return Math.Min(totalBytes, MagickCodecAdapter.MaxAnimationBufferBytes);
+        }
+
         // a display frame a cache pass prepared is held beside the decoded one
         return (long)photo.Width * photo.Height * photo.BytesPerPixel + photo.DisplayFrameBytes;
     }

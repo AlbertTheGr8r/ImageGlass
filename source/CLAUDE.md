@@ -353,6 +353,11 @@ App.Initialize()
 - The reduction flows `SkiaDecoderOutput`/`MagickCodecAdapter` → `CodecDecodeResult.DecodeScale` → `Photo.DecodeScale`, and `AppStatusInfo.Dimension` shows it.
 - `Photo.Size` and `ViewerControl.BitmapSize` follow the DECODED size so zoom, selection, crop, and the color picker stay consistent; only `Photo.Metadata.Width/Height` keep the true file dimensions.
 
+### Animated AVIF & APNG (Magick sequences)
+- Skia has no AVIF decoder, so animated AVIF never reaches `SkiaCodec`; the Magick fallback decodes the whole sequence with libheif (≥ 1.20 track API). `MagickCodec.CanAnimateAsSequence` is the single gate both metadata (`CanAnimate`) and decode use: only `.avif`/`.apng`/`.heif`/`.hif` with FrameCount > 1 animate (never multipage TIFF/PSD/HEIC collections, and never a gain-map pair, which `DetectGainMap` rules out).
+- ImageMagick reads a sequence strictly forward, so per-frame seeks re-decode the whole track; `MagickCodecAdapter.DecodeSequenceFrames__` therefore decodes every frame once and `MagickAnimator` hands each one out repeatedly. Frames are immutable `SKBitmap`s surfaced via `SKImage.FromBitmap` per request, because the viewer's `SKImageRef.Set` disposes the previous returned frame while the animator keeps its own pixels.
+- The whole animation is not decoded when a size box is requested (thumbnail/preview callers want one still) or when the estimated frame bytes exceed `MaxAnimationBufferBytes` (1 GiB): over-budget sequences open as the still first frame. `PhotoManager_Caching.EstimatePhotoMemory` sizes a `MagickAnimator` photo by its frame count so eviction sees the real cost.
+
 ### Multi-size icons (ICO/CUR)
 - A multi-size `.ico`/`.cur` opens on its largest frame (then deepest color, then first). `MagickCodec` picks it into `PhotoMetadata.DefaultFrameIndex` from the frames it already pinged, and the metadata `Width/Height` describe that frame so the preview and its zoom match the final image.
 - **Built-in Magick only.** The index is in Magick's frame order (the ICO directory order), and WIC numbers ICO frames differently, so `Photo.GetDefaultFrameIndex()` returns 0 unless the decode codec is `CodecRegistry.FallbackDecodeCodec`. Plugin-decoded icons open on frame 0; no ABI change.

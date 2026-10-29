@@ -44,6 +44,13 @@ public sealed class MagickCodecAdapter : PhDisposable, ICodec
     /// could pin more than the whole photo cache budget. 1 GiB fits today's sample
     /// (18 frames at 12.6 MB), several hundred frames of phone-photo-size loops, and
     /// rejects absurd content that would otherwise thrash.
+    /// <para>
+    /// The gate sizes the FINAL frames only: the read itself transients much higher,
+    /// because ImageMagick holds every frame as Q16-HDRI float pixels through the whole
+    /// sequence read (measured on Windows: 150 frames of 1080² need 700 MB of finished
+    /// frames but peak around 2.2 GB). The freed-early MagickImage in
+    /// <see cref="DecodeSequenceFrames__"/> trims the tail of that peak, not the read.
+    /// </para>
     /// </summary>
     internal const long MaxAnimationBufferBytes = 1024L * 1024 * 1024;
 

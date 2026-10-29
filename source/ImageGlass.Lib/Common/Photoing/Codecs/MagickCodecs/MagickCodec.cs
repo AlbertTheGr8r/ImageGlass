@@ -326,7 +326,12 @@ public static partial class MagickCodec
             {
                 // get animation frames
                 var skiaFramesInfo = SkiaCodec.GetFramesMetadata(meta.FilePath);
-                meta.CanAnimate = skiaFramesInfo?.Count > 0;
+
+                // Skia cannot open every multi-frame format (AVIF has no Skia decoder),
+                // so a Magick sequence with more than one frame counts as animated too
+                meta.CanAnimate = (skiaFramesInfo?.Count > 0)
+                    || CanAnimateAsSequence(meta.FileExtension, meta.FrameCount, meta.FilePath);
+
                 meta.AnimationLoop = imgC[0].AnimationIterations;
 
                 // get frame metadata
@@ -852,6 +857,33 @@ public static partial class MagickCodec
     public static bool CanRead(string srcFilePath)
     {
         return MagickFormatInfo.Create(srcFilePath)?.SupportsReading ?? false;
+    }
+
+
+    /// <summary>
+    /// Whether a Magick-decoded container that reports multiple frames plays as an
+    /// animation rather than as pages or extra items: AVIF/HEIF sequence tracks and
+    /// APNG. Multi-page TIFF, PSD, multi-image HEIC collections and gain-map pairs
+    /// (base + gain map) must stay still.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="frameCount"/> comes from the metadata ping. Both the metadata
+    /// side of <see cref="PhotoMetadata.CanAnimate"/> and the decode side gate on this
+    /// helper, so they can never disagree about what animates. A sequence whose read
+    /// fails internally (ImageMagick's APNG coder can fork a broken ffmpeg webp delegate
+    /// on some hosts) leaves FrameCount at 0 or 1 and takes this fallback still path.
+    /// </remarks>
+    public static bool CanAnimateAsSequence(string? fileExtension, uint frameCount, string filePath)
+    {
+        if (frameCount <= 1) return false;
+
+        var ext = fileExtension?.ToLowerInvariant() ?? string.Empty;
+        if (ext is not (".avif" or ".apng" or ".heif" or ".hif")) return false;
+
+        // a gain-map pair (SDR base + gain map) is two items in one container, not two frames
+        if (ext is not ".apng" && DetectGainMap(filePath)) return false;
+
+        return true;
     }
 
 

@@ -17,7 +17,11 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 using Avalonia;
+using ImageGlass.Common.Extensions;
+using ImageGlass.Common.Loggers;
 using ImageGlass.Common.Types;
+using ImageMagick;
+using SkiaSharp;
 using System;
 using System.Collections.Generic;
 using System.Threading;
@@ -31,6 +35,17 @@ namespace ImageGlass.Common.Photoing;
 public sealed class MagickCodecAdapter : PhDisposable, ICodec
 {
     private static readonly string[] _supportedExtensions = [];
+
+    /// <summary>
+    /// Pixel bytes a decoded animation may hold in memory before it stops animating and
+    /// opens as a still frame instead. Unlike the Skia pipeline, which composites on the
+    /// fly and keeps 5 frames, the Magick sequence decoder reads the track strictly
+    /// forward, so every frame is pre-decoded up front; without a ceiling, an 8K sequence
+    /// could pin more than the whole photo cache budget. 1 GiB fits today's sample
+    /// (18 frames at 12.6 MB), several hundred frames of phone-photo-size loops, and
+    /// rejects absurd content that would otherwise thrash.
+    /// </summary>
+    internal const long MaxAnimationBufferBytes = 1024L * 1024 * 1024;
 
 
     /// <inheritdoc/>
@@ -89,6 +104,26 @@ public sealed class MagickCodecAdapter : PhDisposable, ICodec
         CodecSelectionContext context,
         CancellationToken cancellationToken = default)
     {
+        // A size box only ever comes from the thumbnail/preview path, which wants one still;
+        // decoding the whole animation for it reads the entire canvas for nothing.
+        var wantsScaledStill = options.Width > 0 && options.Height > 0;
+
+        // The budget is estimated from the metadata frame dimensions before any pixels are
+        // read: HDR frames land at RgbaF32 (16 bytes/px), SDR at Rgba8888 (4 bytes/px).
+        var bytesPerPixel = metadata.IsHdr ? 16 : 4;
+        var estimatedBytes = (long)Math.Max(0, metadata.Width) * Math.Max(0, metadata.Height)
+            * bytesPerPixel * Math.Max(1, metadata.FrameCount);
+        var isOverBudget = estimatedBytes > MaxAnimationBufferBytes;
+
+        if (!wantsScaledStill && !isOverBudget
+            && MagickCodec.CanAnimateAsSequence(metadata.FileExtension, metadata.FrameCount, metadata.FilePath))
+        {
+            return await Task.Factory.StartNew(
+                () => DecodeSequenceFrames__(metadata, options, cancellationToken),
+                cancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default)
+                .Unwrap().ConfigureAwait(false);
+        }
+
         using var output = await MagickCodec.DecodeImageAsync(
             metadata,
             options,
@@ -107,6 +142,112 @@ public sealed class MagickCodecAdapter : PhDisposable, ICodec
             Size = new Size(image?.Width ?? 0, image?.Height ?? 0),
             DecodeScale = decodeScale,
             SingleFrame = image,
+            IsHdr = metadata.IsHdr,
+            HasEmbeddedColorProfile = metadata.SkiaColorSpace is not null || metadata.MagickColorProfile is not null,
+            HasBakedDisplayProfile = MagickCodec.HasBakedDisplayProfile(output, metadata),
+        };
+    }
+
+
+    /// <summary>
+    /// Decodes every frame of a sequence container and builds a <see cref="MagickAnimator"/>.
+    /// ImageMagick reads a sequence strictly forward, so per-frame seeks re-decode the whole
+    /// track; all frames are decoded once here instead, on this background thread.
+    /// </summary>
+    private async Task<CodecDecodeResult> DecodeSequenceFrames__(PhotoMetadata metadata,
+        PhotoReadOptions options, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+
+        // read all frames through the channel pipeline that does color conversions per frame;
+        // the output owns the frames, so conversion must happen inside its using scope
+        using var output = await MagickCodec.DecodeImageAsync(metadata,
+            options with { FrameIndex = -1 }, null, null, token).ConfigureAwait(false);
+
+        var imgColl = output.MultiFrames;
+        if (imgColl?.Count < 2)
+        {
+            // the metadata promised an animation but the decode disagrees; one frame still shows
+            SKImage? onlyFrame = null;
+            var decodeScale = 1d;
+            if (imgColl?.Count == 1)
+            {
+                onlyFrame = SkiaCodec.FromMagick((MagickImage)imgColl[0],
+                    MagickCodec.GetDecodedColorSpace(output, metadata), metadata.IsHdr, out decodeScale);
+            }
+
+            return new CodecDecodeResult
+            {
+                CodecId = CodecId,
+                ContentKind = onlyFrame is not null ? CodecContentKind.StaticRaster : CodecContentKind.None,
+                Size = new Size(onlyFrame?.Width ?? 0, onlyFrame?.Height ?? 0),
+                DecodeScale = decodeScale,
+                SingleFrame = onlyFrame,
+                IsHdr = metadata.IsHdr,
+                HasEmbeddedColorProfile = metadata.SkiaColorSpace is not null || metadata.MagickColorProfile is not null,
+                HasBakedDisplayProfile = MagickCodec.HasBakedDisplayProfile(output, metadata),
+            };
+        }
+
+        var frameCount = imgColl.Count;
+        var frameInfos = new SKCodecFrameInfo[frameCount];
+        var frameBitmaps = new SKBitmap?[frameCount];
+        Size frameSize = default;
+        var minDecodeScale = double.PositiveInfinity;
+        var totalBytes = 0L;
+
+        for (var i = 0; i < frameCount; i++)
+        {
+            token.ThrowIfCancellationRequested();
+
+            using var imgFrame = SkiaCodec.FromMagick((MagickImage)imgColl[i],
+                MagickCodec.GetDecodedColorSpace(output, metadata), metadata.IsHdr, out var frameScale);
+            if (frameScale < minDecodeScale) minDecodeScale = frameScale;
+
+            // frame N owns its own delay; a reader without ticks falls back to the GIF 1/100 s
+            var imgFrameM = (MagickImage)imgColl[i];
+            var ticksPerSecond = imgFrameM.AnimationTicksPerSecond;
+            frameInfos[i] = new SKCodecFrameInfo
+            {
+                Duration = ticksPerSecond > 0
+                    ? (int)Math.Clamp(Math.Round(imgFrameM.AnimationDelay * 1000d / ticksPerSecond), 0, int.MaxValue)
+                    : 0,
+                AlphaType = imgFrame.IsDisposed() ? SKAlphaType.Opaque : imgFrame.AlphaType,
+
+                // Magick delivers fully composed frames, so no frame ever builds on another
+                RequiredFrame = -1,
+                DisposalMethod = SKCodecAnimationDisposalMethod.Keep,
+            };
+
+            if (i == 0 && imgFrame is { } firstFrame)
+            {
+                frameSize = new Size(firstFrame.Width, firstFrame.Height);
+                totalBytes = (long)firstFrame.Info.BytesPerPixel * firstFrame.Width * firstFrame.Height * frameCount;
+            }
+
+            if (imgFrame.IsDisposed()) continue;
+
+            // the animator surfaces each pre-decoded frame per request; the immutable copy
+            // below is its only copy: SKImage.FromBitmap shares the pixels, never re-copies
+            var frameBitmap = SKBitmap.FromImage(imgFrame);
+            frameBitmap.SetImmutable();
+            frameBitmaps[i] = frameBitmap;
+        }
+
+        var animator = new MagickAnimator(frameInfos, frameBitmaps,
+            (int)Math.Clamp(metadata.AnimationLoop, 0, int.MaxValue));
+
+        PhotoTrace.Mark("decode:animation", metadata.FilePath,
+            $"magick frames={frameCount} size={frameSize.Width}x{frameSize.Height} "
+            + $"loop={metadata.AnimationLoop} bytes={totalBytes:n0}");
+
+        return new CodecDecodeResult
+        {
+            CodecId = CodecId,
+            ContentKind = CodecContentKind.Animation,
+            Size = frameSize,
+            DecodeScale = double.IsPositiveInfinity(minDecodeScale) ? 1 : minDecodeScale,
+            Animator = animator,
             IsHdr = metadata.IsHdr,
             HasEmbeddedColorProfile = metadata.SkiaColorSpace is not null || metadata.MagickColorProfile is not null,
             HasBakedDisplayProfile = MagickCodec.HasBakedDisplayProfile(output, metadata),
